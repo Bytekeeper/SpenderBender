@@ -171,6 +171,8 @@ fn import(config: ImportConfig, mut taker: impl FnMut(Record) -> ()) -> Result<(
 struct Groups {
     group_matchers: Vec<(Regex, String)>,
     groups: AHashMap<String, f64>,
+    start: Date,
+    end: Date,
 }
 
 impl Groups {
@@ -183,6 +185,8 @@ impl Groups {
         Ok(Self {
             groups: AHashMap::new(),
             group_matchers,
+            start: Date::MAX,
+            end: Date::MIN,
         })
     }
 
@@ -204,13 +208,26 @@ impl Groups {
             }
             0.0
         }) += record.amount;
+        self.start = self.start.min(record.date);
+        self.end = self.end.max(record.date);
     }
 
     fn print(self) -> Result<()> {
         let mut res: Vec<_> = self.groups.into_iter().collect();
         res.sort_by_key(|(group, amount)| ordered_float::OrderedFloat(*amount));
+        let days = (self.end - self.start).whole_days();
+        let month_factor = 30.0 / days as f64;
+        println!(
+            "Summary of spending and revenue from {} to {} ({} days)",
+            self.start, self.end, days
+        );
         for (group, amount) in res {
-            println!("{:10.2} {}", amount, group);
+            println!(
+                "{:10.2} ({:10.2} / month) {}",
+                amount,
+                amount * month_factor,
+                group
+            );
         }
         Ok(())
     }
