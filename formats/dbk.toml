@@ -1,0 +1,8 @@
+skip = 5
+date_format = "[day].[month].[year]"
+number_locale = "de"
+[map]
+"Auftraggeber" = "party"
+"Buchungstag" = "date"
+"Betrag" = "amount"
+"Buchungstext" = "description"
