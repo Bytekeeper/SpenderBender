@@ -5,9 +5,48 @@ use csv::ReaderBuilder;
 use num_format::{parsing::ParseFormatted, Locale};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::fmt::{Display, Error, Formatter};
 use std::path::PathBuf;
-use time::Date;
+use time::{Date, Month};
+use tokio::runtime::Runtime;
+use warp::Filter;
+
+#[derive(PartialEq, Eq, Hash, Copy, Clone, Serialize)]
+struct MonthYear {
+    month: Month,
+    year: i32,
+}
+
+impl Display for MonthYear {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        write!(f, "{} {}", self.year, self.month)
+    }
+}
+
+impl PartialOrd for MonthYear {
+    fn partial_cmp(&self, rhs: &Self) -> Option<Ordering> {
+        Some(self.cmp(&rhs))
+    }
+}
+
+impl Ord for MonthYear {
+    fn cmp(&self, rhs: &Self) -> Ordering {
+        self.year
+            .cmp(&rhs.year)
+            .then_with(|| (self.month as u8).cmp(&(rhs.month as u8)))
+    }
+}
+
+impl From<Date> for MonthYear {
+    fn from(date: Date) -> Self {
+        Self {
+            month: date.month(),
+            year: date.year(),
+        }
+    }
+}
 
 #[derive(Parser)]
 struct Args {
@@ -19,6 +58,8 @@ struct Args {
     /// Input CSV specification
     #[arg(short = 'i', long, alias = "ff")]
     file_format: Option<PathBuf>,
+    #[arg(short = 's', long)]
+    graph: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -168,9 +209,19 @@ fn import(config: ImportConfig, mut taker: impl FnMut(Record) -> ()) -> Result<(
     Ok(())
 }
 
+#[derive(Serialize)]
+struct Aggregate {
+    start: Date,
+    end: Date,
+    stats_summary: Vec<(String, f64)>,
+    stats_monthly: Vec<(MonthYear, Vec<(String, f64)>)>,
+    stats_grouped: Vec<(String, Vec<(MonthYear, f64)>)>,
+}
+
 struct Groups {
     group_matchers: Vec<(Regex, String)>,
-    groups: AHashMap<String, f64>,
+    stats_summary: AHashMap<String, f64>,
+    stats_monthly: AHashMap<MonthYear, AHashMap<String, f64>>,
     start: Date,
     end: Date,
 }
@@ -183,7 +234,8 @@ impl Groups {
             .flat_map(|(regex, group)| Regex::new(regex).map(|regex| (regex, group.clone())))
             .collect();
         Ok(Self {
-            groups: AHashMap::new(),
+            stats_summary: AHashMap::new(),
+            stats_monthly: AHashMap::new(),
             group_matchers,
             start: Date::MAX,
             end: Date::MIN,
@@ -202,34 +254,57 @@ impl Groups {
                 hit = false;
                 &key
             });
-        *self.groups.entry(key.clone()).or_insert_with(|| {
+        *self.stats_summary.entry(key.clone()).or_insert_with(|| {
             if !hit {
                 eprintln!("No group mapping found for '{}'", key);
             }
             0.0
         }) += record.amount;
+        *self
+            .stats_monthly
+            .entry(record.date.into())
+            .or_insert_with(AHashMap::new)
+            .entry(key.clone())
+            .or_insert(0.0) += record.amount;
         self.start = self.start.min(record.date);
         self.end = self.end.max(record.date);
     }
 
-    fn print(self) -> Result<()> {
-        let mut res: Vec<_> = self.groups.into_iter().collect();
-        res.sort_by_key(|(group, amount)| ordered_float::OrderedFloat(*amount));
-        let days = (self.end - self.start).whole_days();
-        let month_factor = 30.0 / days as f64;
-        println!(
-            "Summary of spending and revenue from {} to {} ({} days)",
-            self.start, self.end, days
-        );
-        for (group, amount) in res {
-            println!(
-                "{:10.2} ({:10.2} / month) {}",
-                amount,
-                amount * month_factor,
-                group
-            );
-        }
-        Ok(())
+    fn aggregate(self) -> Result<Aggregate> {
+        let mut stats_summary: Vec<_> = self.stats_summary.into_iter().collect();
+        stats_summary.sort_by_key(|(group, amount)| ordered_float::OrderedFloat(*amount));
+
+        let mut stats_monthly: Vec<_> = self
+            .stats_monthly
+            .iter()
+            .map(|(m_y, e)| {
+                let mut entries: Vec<_> = e.clone().into_iter().collect();
+                entries.sort_by_key(|(group, amount)| ordered_float::OrderedFloat(-amount.abs()));
+                entries.truncate(20);
+
+                (*m_y, entries)
+            })
+            .collect();
+        stats_monthly.sort_by_key(|(m_y, _)| *m_y);
+        let stats_grouped: Vec<_> = stats_summary
+            .iter()
+            .map(|(g, _)| {
+                let values: Vec<_> = self
+                    .stats_monthly
+                    .iter()
+                    .map(|(m_y, v)| (*m_y, v.get(g).cloned().unwrap_or(0.0)))
+                    .collect();
+                (g.clone(), values)
+            })
+            .collect();
+
+        Ok(Aggregate {
+            start: self.start,
+            end: self.end,
+            stats_summary,
+            stats_monthly,
+            stats_grouped,
+        })
     }
 }
 
@@ -260,6 +335,49 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| GroupConfig::default());
     let mut groups = Groups::new(group_config)?;
     import(import_config, |it| groups.push(it))?;
-    groups.print();
+    let result = groups.aggregate()?;
+    if args.graph {
+        let rt = Runtime::new()?;
+        let mut rng = oorandom::Rand64::new(std::time::UNIX_EPOCH.elapsed()?.as_nanos());
+        let prefix = rng.rand_u64().to_string();
+        println!("Hosting web server on http://127.0.0.1:3030/{}/", prefix);
+        rt.block_on(async {
+            let data = serde_json::to_string(&result)?;
+            let data = warp::path!("data.json").map(move || data.clone());
+            let html =
+                warp::path::end().map(|| warp::reply::html(include_str!("../res/index.html")));
+            let content = warp::path(prefix).and(html.or(data));
+            let pure_css = warp::path!("pure-min.css").map(|| include_str!("../res/pure-min.css"));
+            let chart_js = warp::path!("chart.js").map(|| include_str!("../res/chart.js"));
+            warp::serve(content.or(pure_css).or(chart_js))
+                .run(([127, 0, 0, 1], 3030))
+                .await;
+            Ok::<(), anyhow::Error>(())
+        })?;
+    } else {
+        let days = (result.end - result.start).whole_days();
+        let month_factor = 30.0 / days as f64;
+        println!(
+            "Summary of spending and revenue from {} to {} ({} days)",
+            result.start, result.end, days
+        );
+        for (group, amount) in result.stats_summary {
+            println!(
+                "{:10.2} ({:10.2} / month) {}",
+                amount,
+                amount * month_factor,
+                group
+            );
+        }
+        for (month, groups) in result.stats_monthly {
+            println!("{month}");
+            for (group, amount) in groups.iter().filter(|(_, a)| *a < 0.0) {
+                println!("{:10.2} {}", amount, group);
+            }
+            for (group, amount) in groups.iter().filter(|(_, a)| *a >= 0.0) {
+                println!("{:10.2} {}", amount, group);
+            }
+        }
+    }
     Ok(())
 }

@@ -1,0 +1,40 @@
+<html>
+	<head>
+		<link rel="stylesheet" href="../pure-min.css">
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+	</head>
+	<body>
+		<div class="pure-g">
+			<div class="pure-u-1"><canvas id="myChart"></canvas></div>
+		</div>
+		<script src="../chart.js"></script>
+		<script>
+			fetch('data.json')
+				.then((response) => response.json())
+				.then((response) => {
+					const ctx = document.getElementById('myChart');
+					const labels = response.stats_monthly
+						.map(e => e[0].month + "/" + e[0].year);
+					const datasets = response.stats_grouped
+						.map(e => ({ 
+							label: e[0], 
+							data: e[1].map(d => d[1])
+						}));
+					new Chart(ctx, {
+						type: 'line',
+						data: {
+							labels: labels,
+							datasets: datasets
+						},
+						options: {
+							scales: {
+								y: {
+									type: 'logarithmic'
+								}
+							}
+						}
+					});
+				});
+		</script>
+	</body>
+</html>
