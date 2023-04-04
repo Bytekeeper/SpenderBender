@@ -4,6 +4,7 @@ use clap::Parser;
 use csv::ReaderBuilder;
 use num_format::{parsing::ParseFormatted, Locale};
 use regex::Regex;
+use rust_xlsxwriter::{Format, Workbook, XlsxColor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -163,11 +164,13 @@ fn import(config: ImportConfig, mut taker: impl FnMut(Record) -> ()) -> Result<(
         let mut amount = None;
         let mut description = "".to_string();
         for (index, field) in headers.iter() {
-            let value = String::from_utf8_lossy(
-                result
-                    .get(*index)
-                    .ok_or_else(|| anyhow!("Not enough data columns"))?,
-            );
+            let value = encoding_rs::ISO_8859_15
+                .decode_without_bom_handling(
+                    result
+                        .get(*index)
+                        .ok_or_else(|| anyhow!("Not enough data columns"))?,
+                )
+                .0;
             match field.as_str() {
                 "date" => {
                     date = Some(Date::parse(&value, &date_format).with_context(|| {
@@ -355,12 +358,31 @@ fn main() -> Result<()> {
             Ok::<(), anyhow::Error>(())
         })?;
     } else {
+        let mut workbook = Workbook::new();
+        let worksheet = workbook.add_worksheet().set_name("Summary")?;
+        let currency_format = Format::new().set_num_format("#,##0.00 [$€];[RED]-#,##0.00 [$€]");
+        let month_format = Format::new()
+            .set_bold()
+            .set_font_color(XlsxColor::Blue)
+            .set_font_size(20);
+        worksheet.set_column_format(0, &currency_format)?;
+        worksheet.set_column_format(1, &currency_format)?;
+
         let days = (result.end - result.start).whole_days();
         let month_factor = 30.0 / days as f64;
         println!(
             "Summary of spending and revenue from {} to {} ({} days)",
             result.start, result.end, days
         );
+        worksheet.write_string(
+            0,
+            0,
+            &format!(
+                "Summary of spending and revenue from {} to {} ({} days)",
+                result.start, result.end, days
+            ),
+        )?;
+        let mut row = 1;
         for (group, amount) in result.stats_summary {
             println!(
                 "{:10.2} ({:10.2} / month) {}",
@@ -368,16 +390,37 @@ fn main() -> Result<()> {
                 amount * month_factor,
                 group
             );
+            worksheet.write_number(row, 0, amount)?;
+            worksheet.write_number(row, 1, amount * month_factor)?;
+            worksheet.write_string(row, 2, &group)?;
+            row += 1;
         }
+        worksheet.autofit();
+        let worksheet = workbook.add_worksheet().set_name("Monthly Summary")?;
+        worksheet.set_column_format(0, &currency_format)?;
+        row = 0;
         for (month, groups) in result.stats_monthly {
+            worksheet.write_string_with_format(row, 0, &month.to_string(), &month_format)?;
+            worksheet.set_row_height(row, 24)?;
+            row += 1;
             println!("{month}");
             for (group, amount) in groups.iter().filter(|(_, a)| *a < 0.0) {
                 println!("{:10.2} {}", amount, group);
+                worksheet.write_number(row, 0, *amount)?;
+                worksheet.write_string(row, 1, group)?;
+                row += 1;
             }
             for (group, amount) in groups.iter().filter(|(_, a)| *a >= 0.0) {
                 println!("{:10.2} {}", amount, group);
+                worksheet.write_number(row, 0, *amount)?;
+                worksheet.write_string(row, 1, group)?;
+                row += 1;
             }
+            println!();
+            row += 1;
         }
+        worksheet.autofit();
+        workbook.save("report.xlsx")?;
     }
     Ok(())
 }
