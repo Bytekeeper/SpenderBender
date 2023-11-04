@@ -1,5 +1,6 @@
 use ahash::*;
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::{Datelike, NaiveDate};
 use clap::Parser;
 use csv::ReaderBuilder;
 use num_format::{parsing::ParseFormatted, Locale};
@@ -10,13 +11,12 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Error, Formatter};
 use std::path::PathBuf;
-use time::{Date, Month};
 use tokio::runtime::Runtime;
 use warp::Filter;
 
 #[derive(PartialEq, Eq, Hash, Copy, Clone, Serialize)]
 struct MonthYear {
-    month: Month,
+    month: u32,
     year: i32,
 }
 
@@ -40,8 +40,8 @@ impl Ord for MonthYear {
     }
 }
 
-impl From<Date> for MonthYear {
-    fn from(date: Date) -> Self {
+impl From<NaiveDate> for MonthYear {
+    fn from(date: NaiveDate) -> Self {
         Self {
             month: date.month(),
             year: date.year(),
@@ -58,12 +58,12 @@ struct Args {
     groups: Option<PathBuf>,
     /// Input CSV specification
     #[arg(short = 'i', long, alias = "ff")]
-    file_format: Option<PathBuf>,
+    file_format: PathBuf,
     #[arg(short = 's', long)]
     graph: bool,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 struct ImportConfig {
     skip: Option<usize>,
     date_format: String,
@@ -76,31 +76,27 @@ struct GroupConfig {
     parties: BTreeMap<String, String>,
 }
 
-const CSV_DATE_FORMAT: &[time::format_description::FormatItem] =
-    time::macros::format_description!("[year]-[month]-[day]");
+const CSV_DATE_FORMAT: &str = "%Y-%m-%d";
 
 /// Format used for internal database (not yet implemented)
 #[derive(Debug, Deserialize, Serialize)]
 struct Record<'r> {
     #[serde(serialize_with = "ser_date", deserialize_with = "deser_date")]
-    date: Date,
-    party: &'r str,
+    date: NaiveDate,
+    party1: &'r str,
+    party2: &'r str,
     description: &'r str,
     amount: f64,
 }
 
-fn ser_date<S>(date: &Date, s: S) -> Result<S::Ok, S::Error>
+fn ser_date<S>(date: &NaiveDate, s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    s.serialize_str(
-        &date
-            .format(&CSV_DATE_FORMAT)
-            .map_err(|e| serde::ser::Error::custom(e))?,
-    )
+    s.serialize_str(&date.format(&CSV_DATE_FORMAT).to_string())
 }
 
-fn deser_date<'de, D>(d: D) -> Result<Date, D::Error>
+fn deser_date<'de, D>(d: D) -> Result<NaiveDate, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -108,24 +104,24 @@ where
     use serde::de;
     use std::fmt;
     impl<'de> de::Visitor<'de> for FieldVisitor {
-        type Value = Date;
+        type Value = NaiveDate;
 
         fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
             formatter.write_str("YYYY-MM-DD")
         }
 
-        fn visit_str<E>(self, value: &str) -> Result<Date, E>
+        fn visit_str<E>(self, value: &str) -> Result<NaiveDate, E>
         where
             E: de::Error,
         {
-            Date::parse(value, &CSV_DATE_FORMAT).map_err(|e| de::Error::custom(e))
+            NaiveDate::parse_from_str(value, &CSV_DATE_FORMAT).map_err(|e| de::Error::custom(e))
         }
     }
     d.deserialize_str(FieldVisitor)
 }
 
 fn import(config: ImportConfig, mut taker: impl FnMut(Record) -> ()) -> Result<()> {
-    let date_format = time::format_description::parse(&config.date_format)?;
+    let date_format = &config.date_format;
     let number_locale = config
         .number_locale
         .map(|locale| Locale::from_name(locale))
@@ -133,20 +129,20 @@ fn import(config: ImportConfig, mut taker: impl FnMut(Record) -> ()) -> Result<(
         .unwrap_or(Locale::en);
 
     let args: Vec<String> = std::env::args().collect();
-    let mut rdr = ReaderBuilder::new()
+    let rdr = ReaderBuilder::new()
         .delimiter(b';')
         .flexible(true)
         .has_headers(false)
         .from_path(&args[1])?;
     let records = rdr.into_byte_records();
-    let mut records = records.skip(4);
+    let mut records = records.skip(config.skip.unwrap_or(0));
     let header = records.next().ok_or(anyhow!(""))??;
     let field_matchers: Vec<_> = config
         .map
         .iter()
         .flat_map(|(regex, field)| Regex::new(regex).map(|regex| (regex, field)))
         .collect();
-    let mut headers: Vec<_> = header
+    let headers: Vec<_> = header
         .iter()
         .enumerate()
         .flat_map(|(i, hdr)| {
@@ -160,11 +156,12 @@ fn import(config: ImportConfig, mut taker: impl FnMut(Record) -> ()) -> Result<(
     for result in records {
         let result = result?;
         let mut date = None;
-        let mut party = None;
+        let mut party1 = None;
+        let mut party2 = None;
         let mut amount = None;
         let mut description = "".to_string();
         for (index, field) in headers.iter() {
-            let value = encoding_rs::ISO_8859_15
+            let value = encoding_rs::UTF_8
                 .decode_without_bom_handling(
                     result
                         .get(*index)
@@ -173,36 +170,53 @@ fn import(config: ImportConfig, mut taker: impl FnMut(Record) -> ()) -> Result<(
                 .0;
             match field.as_str() {
                 "date" => {
-                    date = Some(Date::parse(&value, &date_format).with_context(|| {
-                        format!("Parsing '{}' at '{:?}'", value, result.position())
-                    })?)
+                    date = Some(
+                        NaiveDate::parse_from_str(&value, &date_format).with_context(|| {
+                            format!(
+                                "Parsing '{}' at '{:?}' - is the format '{:?}' correct?",
+                                value,
+                                result.position(),
+                                date_format
+                            )
+                        })?,
+                    )
                 }
-                "party" => party = Some(value.to_string()),
+                "party1" => party1 = Some(value.to_string()),
+                "party2" => party2 = Some(value.to_string()),
                 "amount" => {
-                    let mut x = value.splitn(2, number_locale.decimal());
-                    let int = x.next().ok_or_else(|| anyhow!("Invalid number"))?;
-                    let fract = x.next();
+                    let x = value
+                        .split_once(number_locale.decimal())
+                        .context("Amount missing or invalid number")?;
+                    let int = x.0;
+                    let fract = x.1.split_once(' ').map(|(r, _)| r).unwrap_or(x.1);
                     let mut result =
                         int.parse_formatted::<_, i64>(&number_locale)
                             .with_context(|| {
                                 format!("Parsing '{}' at {:?}", value, result.position())
                             })? as f64;
-                    if let Some(fract) = fract {
-                        result +=
-                            fract.parse::<u64>()? as f64 * 10.0_f64.powf(-(fract.len() as f64));
-                    }
+                    result += fract.parse::<u64>()? as f64 * 10.0_f64.powf(-(fract.len() as f64));
                     amount = Some(result)
                 }
                 "description" => description = value.to_string(),
                 _ => unreachable!("Field '{}' does not exist", field),
             }
         }
-        let Some(date) = date else { bail!("Date missing") };
-        let Some(party) = &party else { bail!("Party missing") };
-        let Some(amount) = amount else { bail!("Amount missing") };
+        let Some(date) = date else {
+            bail!("Date missing in '{:?}'", result)
+        };
+        let Some(party1) = &party1 else {
+            bail!("Party 1 missing")
+        };
+        let Some(party2) = &party2 else {
+            bail!("Party 2 missing")
+        };
+        let Some(amount) = amount else {
+            bail!("Amount missing")
+        };
         let record = Record {
             date,
-            party,
+            party1,
+            party2,
             amount,
             description: &description,
         };
@@ -214,8 +228,8 @@ fn import(config: ImportConfig, mut taker: impl FnMut(Record) -> ()) -> Result<(
 
 #[derive(Serialize)]
 struct Aggregate {
-    start: Date,
-    end: Date,
+    start: NaiveDate,
+    end: NaiveDate,
     stats_summary: Vec<(String, f64)>,
     stats_monthly: Vec<(MonthYear, Vec<(String, f64)>)>,
     stats_grouped: Vec<(String, Vec<(MonthYear, f64)>)>,
@@ -225,8 +239,8 @@ struct Groups {
     group_matchers: Vec<(Regex, String)>,
     stats_summary: AHashMap<String, f64>,
     stats_monthly: AHashMap<MonthYear, AHashMap<String, f64>>,
-    start: Date,
-    end: Date,
+    start: NaiveDate,
+    end: NaiveDate,
 }
 
 impl Groups {
@@ -240,14 +254,18 @@ impl Groups {
             stats_summary: AHashMap::new(),
             stats_monthly: AHashMap::new(),
             group_matchers,
-            start: Date::MAX,
-            end: Date::MIN,
+            start: NaiveDate::MAX,
+            end: NaiveDate::MIN,
         })
     }
 
     fn push(&mut self, record: Record<'_>) {
         let mut hit = true;
-        let key = record.party.to_string().to_lowercase();
+        let key = if record.amount < 0.0 {
+            record.party2.to_string().to_lowercase()
+        } else {
+            record.party1.to_string().to_lowercase()
+        };
         let key = self
             .group_matchers
             .iter()
@@ -275,14 +293,14 @@ impl Groups {
 
     fn aggregate(self) -> Result<Aggregate> {
         let mut stats_summary: Vec<_> = self.stats_summary.into_iter().collect();
-        stats_summary.sort_by_key(|(group, amount)| ordered_float::OrderedFloat(*amount));
+        stats_summary.sort_by_key(|(_, amount)| ordered_float::OrderedFloat(*amount));
 
         let mut stats_monthly: Vec<_> = self
             .stats_monthly
             .iter()
             .map(|(m_y, e)| {
                 let mut entries: Vec<_> = e.clone().into_iter().collect();
-                entries.sort_by_key(|(group, amount)| ordered_float::OrderedFloat(-amount.abs()));
+                entries.sort_by_key(|(_, amount)| ordered_float::OrderedFloat(-amount.abs()));
                 entries.truncate(20);
 
                 (*m_y, entries)
@@ -322,18 +340,14 @@ fn main() -> Result<()> {
     // })?;
     // wtr.flush()?;
 
-    let import_config: ImportConfig = args
-        .file_format
-        .map(|f| std::fs::read(f))
-        .transpose()?
-        .map(|f| toml::from_slice(&f))
-        .transpose()?
-        .unwrap_or_else(|| ImportConfig::default());
+    let import_config: Result<ImportConfig, _> =
+        toml::from_str(std::str::from_utf8(&std::fs::read(args.file_format)?)?);
+    let import_config = import_config?;
     let group_config: GroupConfig = args
         .groups
-        .map(|f| std::fs::read(f))
-        .transpose()?
-        .map(|f| toml::from_slice(&f))
+        .map::<anyhow::Result<GroupConfig>, _>(|f| {
+            Ok(toml::from_str(std::str::from_utf8(&std::fs::read(f)?)?)?)
+        })
         .transpose()?
         .unwrap_or_else(|| GroupConfig::default());
     let mut groups = Groups::new(group_config)?;
@@ -368,7 +382,7 @@ fn main() -> Result<()> {
         worksheet.set_column_format(0, &currency_format)?;
         worksheet.set_column_format(1, &currency_format)?;
 
-        let days = (result.end - result.start).whole_days();
+        let days = (result.end - result.start).num_days();
         let month_factor = 30.0 / days as f64;
         println!(
             "Summary of spending and revenue from {} to {} ({} days)",

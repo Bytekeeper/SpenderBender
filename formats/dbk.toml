@@ -1,8 +1,9 @@
-skip = 5
-date_format = "[day].[month].[year]"
+skip = 4
+date_format = "%d.%m.%y"
 number_locale = "de"
 [map]
-"Auftraggeber" = "party"
-"Buchungstag" = "date"
+"Zahlungspflichtige\\*r" = "party1"
+"Zahlungsempfänger\\*in" = "party2"
+"Buchungsdatum" = "date"
 "Betrag" = "amount"
-"Buchungstext" = "description"
+"Buchungstext" = "Verwendungszweck"
