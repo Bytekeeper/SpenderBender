@@ -120,7 +120,7 @@ where
     d.deserialize_str(FieldVisitor)
 }
 
-fn import(config: ImportConfig, mut taker: impl FnMut(Record) -> ()) -> Result<()> {
+fn import(file: PathBuf, config: ImportConfig, mut taker: impl FnMut(Record) -> ()) -> Result<()> {
     let date_format = &config.date_format;
     let number_locale = config
         .number_locale
@@ -128,12 +128,11 @@ fn import(config: ImportConfig, mut taker: impl FnMut(Record) -> ()) -> Result<(
         .transpose()?
         .unwrap_or(Locale::en);
 
-    let args: Vec<String> = std::env::args().collect();
     let rdr = ReaderBuilder::new()
         .delimiter(b';')
         .flexible(true)
         .has_headers(false)
-        .from_path(&args[1])?;
+        .from_path(file)?;
     let records = rdr.into_byte_records();
     let mut records = records.skip(config.skip.unwrap_or(0));
     let header = records.next().ok_or(anyhow!(""))??;
@@ -152,7 +151,14 @@ fn import(config: ImportConfig, mut taker: impl FnMut(Record) -> ()) -> Result<(
                 .map(|(_, field)| (i, field))
         })
         .collect();
-    // eprintln!("{headers:?}");
+    if headers.len() != config.map.len() {
+        eprintln!(
+            "Headers configured: {:?}, headers actually found: {:?}",
+            config.map.keys().collect::<Vec<_>>(),
+            headers
+        );
+    }
+    eprintln!("{headers:?}");
     for result in records {
         let result = result?;
         let mut date = None;
@@ -186,7 +192,7 @@ fn import(config: ImportConfig, mut taker: impl FnMut(Record) -> ()) -> Result<(
                 "amount" => {
                     let x = value
                         .split_once(number_locale.decimal())
-                        .context("Amount missing or invalid number")?;
+                        .unwrap_or_else(|| (&value, "0"));
                     let int = x.0;
                     let fract = x.1.split_once(' ').map(|(r, _)| r).unwrap_or(x.1);
                     let mut result =
@@ -198,6 +204,10 @@ fn import(config: ImportConfig, mut taker: impl FnMut(Record) -> ()) -> Result<(
                     amount = Some(result)
                 }
                 "description" => description = value.to_string(),
+                "party" => {
+                    party1 = Some(value.to_string());
+                    party2 = Some(value.to_string());
+                }
                 _ => unreachable!("Field '{}' does not exist", field),
             }
         }
@@ -351,7 +361,7 @@ fn main() -> Result<()> {
         .transpose()?
         .unwrap_or_else(|| GroupConfig::default());
     let mut groups = Groups::new(group_config)?;
-    import(import_config, |it| groups.push(it))?;
+    import(args.file, import_config, |it| groups.push(it))?;
     let result = groups.aggregate()?;
     if args.graph {
         let rt = Runtime::new()?;
