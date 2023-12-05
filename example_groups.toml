@@ -1,0 +1,6 @@
+# This is an example grouping file. 
+
+# This matcher group will try to match the party fields and assign it to a group
+[parties]
+# The left side is a regular expression, that when matched will result in the entry to be aggregated into the group on the right side.
+"obi |toom bm|hornbach|baufachmarkt" = "Baumarkt"
