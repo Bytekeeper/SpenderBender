@@ -1,9 +1,10 @@
 skip = 4
 date_format = "%d.%m.%y"
 number_locale = "de"
+comma_delimiter = false
 [map]
 "Zahlungspflichtige\\*r" = "party1"
 "Zahlungsempfänger\\*in" = "party2"
 "Buchungsdatum" = "date"
-"Betrag" = "amount"
+"Betrag (.*)" = "amount"
 "Buchungstext" = "Verwendungszweck"
