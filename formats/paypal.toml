@@ -1,0 +1,9 @@
+date_format = "%d.%m.%Y"
+number_locale = "de"
+comma_delimiter = true
+[map]
+"Absender" = "party1"
+"^Name$" = "party2"
+"Datum" = "date"
+"Artikelbezeichnung" = "description"
+"^Guthaben$" = "amount"

@@ -61,6 +61,8 @@ struct Args {
     file_format: PathBuf,
     #[arg(short = 's', long)]
     graph: bool,
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -449,7 +451,7 @@ fn main() -> Result<()> {
             row += 1;
         }
         worksheet.autofit();
-        workbook.save("report.xlsx")?;
+        workbook.save(args.output.unwrap_or("result.xlsx".into()))?;
     }
     Ok(())
 }

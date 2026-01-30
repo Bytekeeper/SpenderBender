@@ -7,4 +7,4 @@ comma_delimiter = false
 "Zahlungsempfänger\\*in" = "party2"
 "Buchungsdatum" = "date"
 "Betrag (.*)" = "amount"
-"Buchungstext" = "Verwendungszweck"
+"Buchungstext" = "description"
