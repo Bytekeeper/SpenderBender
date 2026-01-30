@@ -5,7 +5,7 @@ use clap::Parser;
 use csv::ReaderBuilder;
 use num_format::{parsing::ParseFormatted, Locale};
 use regex::Regex;
-use rust_xlsxwriter::{Format, Workbook, XlsxColor};
+use rust_xlsxwriter::{Color, Format, Workbook};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -66,6 +66,7 @@ struct Args {
 #[derive(Debug, Deserialize)]
 struct ImportConfig {
     skip: Option<usize>,
+    comma_delimiter: bool,
     date_format: String,
     number_locale: Option<String>,
     map: BTreeMap<String, String>,
@@ -129,7 +130,7 @@ fn import(file: PathBuf, config: ImportConfig, mut taker: impl FnMut(Record) -> 
         .unwrap_or(Locale::en);
 
     let rdr = ReaderBuilder::new()
-        .delimiter(b';')
+        .delimiter(if config.comma_delimiter { b',' } else { b';' })
         .flexible(true)
         .has_headers(false)
         .from_path(file)?;
@@ -195,12 +196,16 @@ fn import(file: PathBuf, config: ImportConfig, mut taker: impl FnMut(Record) -> 
                         .unwrap_or_else(|| (&value, "0"));
                     let int = x.0;
                     let fract = x.1.split_once(' ').map(|(r, _)| r).unwrap_or(x.1);
+                    eprintln!("---- {}.{}", int, fract);
                     let mut result =
                         int.parse_formatted::<_, i64>(&number_locale)
                             .with_context(|| {
                                 format!("Parsing '{}' at {:?}", value, result.position())
                             })? as f64;
-                    result += fract.parse::<u64>()? as f64 * 10.0_f64.powf(-(fract.len() as f64));
+                    result += fract.parse::<u64>()? as f64
+                        * 10.0_f64.powf(-(fract.len() as f64))
+                        * result.signum();
+                    eprintln!("==> {}", result);
                     amount = Some(result)
                 }
                 "description" => description = value.to_string(),
@@ -387,7 +392,7 @@ fn main() -> Result<()> {
         let currency_format = Format::new().set_num_format("#,##0.00 [$€];[RED]-#,##0.00 [$€]");
         let month_format = Format::new()
             .set_bold()
-            .set_font_color(XlsxColor::Blue)
+            .set_font_color(Color::Blue)
             .set_font_size(20);
         worksheet.set_column_format(0, &currency_format)?;
         worksheet.set_column_format(1, &currency_format)?;
